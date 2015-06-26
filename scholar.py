@@ -156,6 +156,14 @@ import optparse
 import os
 import sys
 import re
+import time
+import random
+
+#import socks
+#import socket
+
+#socks.setdefaultproxy(socks.PROXY_TYPE_SOCKS5, "127.0.0.1", 9050)
+#socket.socket = socks.socksocket
 
 try:
     # Try importing for Python 3
@@ -166,7 +174,7 @@ try:
     from http.cookiejar import MozillaCookieJar
 except ImportError:
     # Fallback for Python 2
-    from urllib2 import Request, build_opener, HTTPCookieProcessor
+    from urllib2 import Request, build_opener, HTTPCookieProcessor, ProxyHandler, HTTPPasswordMgr
     from urllib import quote, unquote
     from cookielib import MozillaCookieJar
 
@@ -210,6 +218,7 @@ class ScholarConf(object):
     VERSION = '2.9'
     LOG_LEVEL = 1
     MAX_PAGE_RESULTS = 20 # Current maximum for per-page results
+    MAX_QUERY_RESULTS = 999 # Current maximum for overall query results
     SCHOLAR_SITE = 'http://scholar.google.com'
 
     # USER_AGENT = 'Mozilla/5.0 (X11; U; FreeBSD i386; en-US; rv:1.9.2.9) Gecko/20100913 Firefox/3.6.9'
@@ -219,6 +228,10 @@ class ScholarConf(object):
     # If set, we will use this file to read/save cookies to enable
     # cookie use across sessions.
     COOKIE_JAR_FILE = None
+
+    # Seconds to wait between consecutive queries.
+    WAITING_TIME = 61
+
 
 class ScholarUtils(object):
     """A wrapper for various utensils that come in handy."""
@@ -265,7 +278,8 @@ class ScholarArticle(object):
             'url_citations': [None, 'Citations list', 7],
             'url_versions':  [None, 'Versions list',  8],
             'url_citation':  [None, 'Citation link',  9],
-            'excerpt':       [None, 'Excerpt',       10],
+            'gs_id':         [None, 'Article ID',    10],
+            'excerpt':       [None, 'Excerpt',       11],
         }
 
         # The citation data in one of the standard export formats,
@@ -356,6 +370,7 @@ class ScholarArticleParser(object):
         content as needed, and notifies the parser instance of
         resulting instances via the handle_article callback.
         """
+        had_more = False
         self.soup = BeautifulSoup(html)
 
         # This parses any global, non-itemized attributes from the page.
@@ -367,6 +382,9 @@ class ScholarArticleParser(object):
             self._clean_article()
             if self.article['title']:
                 self.handle_article(self.article)
+                had_more = True
+
+        return had_more
 
     def _clean_article(self):
         """
@@ -450,6 +468,23 @@ class ScholarArticleParser(object):
                 self.article['url_versions'] = \
                     self._strip_url_arg('num', self._path2url(tag.get('href')))
 
+            if tag.get('href').startswith('/scholar?q=related'):
+                args = tag.get('href').split('?', 1)[1]
+                for arg in args.split(':scholar'):
+                    if arg.startswith('q=related:'):
+                        self.article['gs_id'] = arg[10:]
+
+            # Sometimes the link to related articles is not present
+            # and the extraction of the article id as above fails.
+            # Below we also utilize the 'cite' convenience
+            # link provided by Google Scholar to extract the article id.
+            if (not hasattr(self.article, 'gs_id')) \
+                    and hasattr(tag, 'onclick') \
+                    and (not tag.get('onclick') is None):
+                if tag.get('onclick').startswith('return gs_ocit'):
+                    args = tag.get('onclick').split('\'')
+                    self.article['gs_id'] = args[1]
+                    
             if tag.getText().startswith('Import'):
                 self.article['url_citation'] = self._path2url(tag.get('href'))
 
@@ -597,21 +632,27 @@ class ScholarQuery(object):
     """
     def __init__(self):
         self.url = None
-
+        self.num_page_results = ScholarConf.MAX_PAGE_RESULTS
+        
         # The number of results requested from Scholar -- not the
         # total number of results it reports (the latter gets stored
         # in attrs, see below).
         self.num_results = ScholarConf.MAX_PAGE_RESULTS
-
+       
         # Queries may have global result attributes, similar to
         # per-article attributes in ScholarArticle. The exact set of
         # attributes may differ by query type, but they all share the
         # basic data structure:
         self.attrs = {}
 
+
     def set_num_page_results(self, num_page_results):
         msg = 'maximum number of results on page must be numeric'
         self.num_results = ScholarUtils.ensure_int(num_page_results, msg)
+
+    def set_num_results(self, num_results):
+        msg = 'maximum number of results on page must be numeric'
+        self.num_results = ScholarUtils.ensure_int(num_results, msg)
 
     def get_url(self):
         """
@@ -633,7 +674,7 @@ class ScholarQuery(object):
         idx = max([item[2] for item in self.attrs.values()]) + 1
         self.attrs[key] = [default_value, label, idx]
 
-    def __getitem__(self, key):
+            def __getitem__(self, key):
         """Getter for attribute value. Returns None if no such key."""
         if key in self.attrs:
             return self.attrs[key][0]
@@ -696,12 +737,49 @@ class ClusterScholarQuery(ScholarQuery):
             raise QueryArgumentError('cluster query needs cluster ID')
 
         urlargs = {'cluster': self.cluster,
-                   'num': self.num_results or ScholarConf.MAX_PAGE_RESULTS}
+                   'num': self.num_page_results or ScholarConf.MAX_PAGE_RESULTS}
 
         for key, val in urlargs.items():
             urlargs[key] = quote(encode(val))
 
         return self.SCHOLAR_CLUSTER_URL % urlargs
+
+
+class CiteScholarQuery(ScholarQuery):
+    """
+    This version just pulls up an article cluster whose ID we already
+    know about.
+    """
+    SCHOLAR_CITATION_URL = ScholarConf.SCHOLAR_SITE + '/scholar?' \
+        + 'cites=%(cluster)s' \
+        + '&num=%(num)s' \
+        + '&start=%(startpage)s'
+
+    def __init__(self, cluster=None):
+        ScholarQuery.__init__(self)
+        self.cluster = None
+        self.set_cluster(cluster)
+        self.startpage = 0
+
+    def set_cluster(self, cluster):
+        """
+        Sets search to a Google Scholar results cluster ID.
+        """
+        msg = 'cluster ID must be numeric'
+        self.cluster = ScholarUtils.ensure_int(cluster, msg)
+
+    def get_url(self):
+        if self.cluster is None:
+            raise QueryArgumentError('citation query needs cluster ID')
+
+        urlargs = {'cluster': self.cluster,
+                   'num': self.num_page_results or ScholarConf.MAX_PAGE_RESULTS,
+                   'startpage': self.startpage or '0'}
+
+        for key, val in urlargs.items():
+            urlargs[key] = quote(str(val))
+
+        return self.SCHOLAR_CITATION_URL % urlargs
 
 
 class SearchScholarQuery(ScholarQuery):
@@ -719,6 +797,8 @@ class SearchScholarQuery(ScholarQuery):
         + '&as_publication=%(pub)s' \
         + '&as_ylo=%(ylo)s' \
         + '&as_yhi=%(yhi)s' \
+#        + '&btnG=&hl=en&as_sdt=0,5&num=%(num)s' \
+#        + '&start=%(startpage)s'
         + '&as_sdt=%(patents)s%%2C5' \
         + '&as_vis=%(citations)s' \
         + '&btnG=&hl=en' \
@@ -735,8 +815,10 @@ class SearchScholarQuery(ScholarQuery):
         self.author = None 
         self.pub = None
         self.timeframe = [None, None]
+        self.startpage = 0
         self.include_patents = True
         self.include_citations = True
+
 
     def set_words(self, words):
         """Sets words that *all* must be found in the result."""
@@ -815,6 +897,8 @@ class SearchScholarQuery(ScholarQuery):
                    'pub': self.pub or '',
                    'ylo': self.timeframe[0] or '',
                    'yhi': self.timeframe[1] or '',
+#                   'num': self.num_page_results or ScholarConf.MAX_PAGE_RESULTS,
+#                   'startpage': self.startpage or '0'}
                    'patents': '0' if self.include_patents else '1',
                    'citations': '0' if self.include_citations else '1',
                    'num': self.num_results or ScholarConf.MAX_PAGE_RESULTS}
@@ -904,6 +988,7 @@ class ScholarQuerier(object):
     def __init__(self):
         self.articles = []
         self.query = None
+        self.user_agent = ScholarConf.USER_AGENT
         self.cjar = MozillaCookieJar()
 
         # If we have a cookie file, load it:
@@ -965,7 +1050,7 @@ class ScholarQuerier(object):
 
         html = self._get_http_response(url=self.SET_SETTINGS_URL % urlargs,
                                        log_msg='dump of settings result HTML',
-                                       err_msg='applying setttings failed')
+                                       err_msg='applying settings failed')
         if html is None:
             return False
 
@@ -980,13 +1065,33 @@ class ScholarQuerier(object):
         self.clear_articles()
         self.query = query
 
-        html = self._get_http_response(url=query.get_url(),
-                                       log_msg='dump of query response HTML',
-                                       err_msg='results retrieval failed')
-        if html is None:
-            return
+        if self.settings is None:
+            ppr = ScholarConf.MAX_PAGE_RESULTS
+        else:
+            ppr = self.settings.per_page_results
 
-        self.parse(html)
+        max_results = min(query.num_results, ScholarConf.MAX_QUERY_RESULTS)
+
+        for x in xrange(0, max_results, ppr):
+            ScholarUtils.log('info', 'querying for %d to %d out of %d' % (x, x + ppr, max_results))
+
+            query.startpage = x
+
+            if x != 0 and ScholarConf.WAITING_TIME != 0:
+                ScholarUtils.log('info', 'waiting %d seconds before querying' % ScholarConf.WAITING_TIME)
+                time.sleep(ScholarConf.WAITING_TIME)
+            
+            html = self._get_http_response(url=query.get_url(),
+                                           log_msg='dump of query response HTML',
+                                           err_msg='results retrieval failed')
+            if html is None:
+                ScholarUtils.log('warn', 'html gotten from http response was None')
+                return
+
+            had_more = self.parse(html)
+            if not had_more:
+                ScholarUtils.log('info', 'query yielded no new articles, aborting')
+                return
 
     def get_citation_data(self, article):
         """
@@ -1014,6 +1119,7 @@ class ScholarQuerier(object):
         This method allows parsing of provided HTML content.
         """
         parser = self.Parser(self)
+#T        return parser.parse(html)
         parser.parse(html)
 
     def add_article(self, art):
@@ -1051,7 +1157,7 @@ class ScholarQuerier(object):
         try:
             ScholarUtils.log('info', 'requesting %s' % unquote(url))
 
-            req = Request(url=url, headers={'User-Agent': ScholarConf.USER_AGENT})
+            req = Request(url=url, headers={'User-Agent': self.user_agent})
             hdl = self.opener.open(req)
             html = hdl.read()
 
@@ -1094,11 +1200,11 @@ def txt(querier, with_globals):
     for art in articles:
         print(encode(art.as_txt()) + '\n')
 
-def csv(querier, header=False, sep='|'):
+def csv(querier, header=False, sep='|', pfile=sys.stdout):
     articles = querier.articles
     for art in articles:
         result = art.as_csv(header=header, sep=sep)
-        print(encode(result))
+        print >>pfile, encode(result)
         header = False
 
 def citation_export(querier):
@@ -1106,6 +1212,60 @@ def citation_export(querier):
     for art in articles:
         print(art.as_citation() + '\n')
 
+def build_citation_graph(querier, max_citations, dump_dir):
+
+    dump_dir_valid = True
+    if dump_dir is not None:
+        dump_dir = os.path.abspath(dump_dir)
+        if os.path.exists(dump_dir) and (not os.path.isdir(dump_dir)):
+            ScholarUtils.log('warn', 'path %s is not a directory %s, continuing without dumping' % dump_dir)
+            dump_dir_valid = False
+            
+        if not os.path.exists(dump_dir):
+            try:
+                os.makedirs(dump_dir)
+            except Exception as msg:
+                ScholarUtils.log('warn', 'could not create directory %s because of \'%s\', continuing without dumping' % (dump_dir, msg))
+                dump_dir_valid = False
+        
+        if dump_dir_valid:
+            file = open(dump_dir + '/query.list', 'w')
+            try:
+                csv(querier, pfile=file)
+            finally:
+                file.close
+
+    articles = querier.articles   
+    for art in articles:
+        if art['cluster_id'] is None:
+            ScholarUtils.log('warn', 'omitting article because it has no cluster_id: %s' % art.as_txt())
+            continue
+
+        if art['num_citations'] > max_citations:
+            ScholarUtils.log('info', 'omitting article because it had too many citations: %s' % art.as_txt())
+            continue
+        
+        query = CiteScholarQuery(cluster=art['cluster_id'])
+	query.set_num_results(art['num_citations'])
+        querier.send_query(query)
+
+        ScholarUtils.log('info', 'waiting %d seconds before querying' % ScholarConf.WAITING_TIME)
+        time.sleep(ScholarConf.WAITING_TIME)
+        citations = querier.articles
+
+        file = open(dump_dir + ('/cites-%s.list' % art['cluster_id']), 'w')
+        try:
+            csv(querier, pfile=file)
+        finally:
+            file.close
+
+        for cite in citations:
+            if not cite['cluster_id'] is None:
+                print(encode('%s %s' % (art['cluster_id'], cite['cluster_id'])))
+            elif not cite['gs_id'] is None:
+                print(encode('%s %s' % (art['cluster_id'], cite['gs_id'])))
+            else:
+                ScholarUtils.log('warn', 'omitting article because it has neither cluster nor article id: %s' % art.as_txt())
 
 def main():
     usage = """scholar.py [options] <query string>
@@ -1151,8 +1311,12 @@ scholar.py -c 5 -a "albert einstein" -t --none "quantum theory" --after 1970"""
                      help='Do not include citations in results')
     group.add_option('-C', '--cluster-id', metavar='CLUSTER_ID', default=None,
                      help='Do not search, just use articles in given cluster ID')
-    group.add_option('-c', '--count', type='int', default=None,
+    group.add_option('-I', '--cites', metavar='CLUSTER_ID', default=None, dest='cites_id',
+                     help='Query for all articles citing the given cluster ID')
+    group.add_option('-c', '--count', type='int', default=20,
                      help='Maximum number of results')
+    group.add_option('--max-citations', type='int', default=10000,
+                     help='When building the citation graph, only fetch citations for articles if they are cited at most the given number of times')
     parser.add_option_group(group)
 
     group = optparse.OptionGroup(parser, 'Output format',
@@ -1167,11 +1331,17 @@ scholar.py -c 5 -a "albert einstein" -t --none "quantum theory" --after 1970"""
                      help='Like --csv, but print header with column names')
     group.add_option('--citation', metavar='FORMAT', default=None,
                      help='Print article details in standard citation format. Argument Must be one of "bt" (BibTeX), "en" (EndNote), "rm" (RefMan), or "rw" (RefWorks).')
+    group.add_option('--build-citation-graph', action='store_true',
+                     help='Query for the citations of each article and build a graph out of the cluster and/or article ids')
+    group.add_option('--dump-dir', metavar='DIRECTORY', default=None,
+                     help='Wenn building citation graph, write full parsing results to directory')
     parser.add_option_group(group)
 
     group = optparse.OptionGroup(parser, 'Miscellaneous')
     group.add_option('--cookie-file', metavar='FILE', default=None,
                      help='File to use for cookie storage. If given, will read any existing cookies if found at startup, and save resulting cookies in the end.')
+    group.add_option('--user-agent-list', metavar='FILE', default=None,
+                     help='File to use for selecting a user agent. The file should contain one agent string per line and a random one is selected.')
     group.add_option('-d', '--debug', action='count', default=0,
                      help='Enable verbose logging to stderr. Repeated options increase detail of debug output.')
     group.add_option('-v', '--version', action='store_true', default=False,
@@ -1197,9 +1367,14 @@ scholar.py -c 5 -a "albert einstein" -t --none "quantum theory" --after 1970"""
     if options.cookie_file:
         ScholarConf.COOKIE_JAR_FILE = options.cookie_file
 
-    # Sanity-check the options: if they include a cluster ID query, it
+    # Sanity-check the options: it makes no sense to combine citation and
+    # cluster-id search and if the options include a cluster ID query, it
     # makes no sense to have search arguments:
-    if options.cluster_id is not None:
+    if (options.cluster_id is not None) and (options.cites_id is not None):
+        print 'Cannot search for all versions in a cluster ID and all articles citing this cluster ID simultaneously.'
+        return 1
+
+    if (options.cluster_id is not None) or (options.cites_id is not None):
         if options.author or options.allw or options.some or options.none \
            or options.phrase or options.title_only or options.pub \
            or options.after or options.before:
@@ -1207,6 +1382,22 @@ scholar.py -c 5 -a "albert einstein" -t --none "quantum theory" --after 1970"""
             return 1
 
     querier = ScholarQuerier()
+
+    if options.user_agent_list:
+        with open(options.user_agent_list, 'rb') as ual_file:
+            i = 0
+            for i, l in enumerate(ual_file):
+                pass
+            agent_no = random.randint(0,i)
+
+            ual_file.seek(0)
+            for i, l in enumerate(ual_file):
+                if i == agent_no:
+                    ScholarUtils.log('info', 'setting user agent to %s' % l)
+                    querier.user_agent = l
+                    break
+                pass
+
     settings = ScholarSettings()
 
     if options.citation == 'bt':
@@ -1225,6 +1416,8 @@ scholar.py -c 5 -a "albert einstein" -t --none "quantum theory" --after 1970"""
 
     if options.cluster_id:
         query = ClusterScholarQuery(cluster=options.cluster_id)
+    elif options.cites_id:
+        query = CiteScholarQuery(cluster=options.cites_id)
     else:
         query = SearchScholarQuery()
         if options.author:
@@ -1249,12 +1442,16 @@ scholar.py -c 5 -a "albert einstein" -t --none "quantum theory" --after 1970"""
             query.set_include_citations(False)
 
     if options.count is not None:
-        options.count = min(options.count, ScholarConf.MAX_PAGE_RESULTS)
-        query.set_num_page_results(options.count)
+#        options.count = min(options.count, ScholarConf.MAX_PAGE_RESULTS)
+        query.set_num_results(options.count)
+
+    
 
     querier.send_query(query)
 
-    if options.csv:
+    if options.build_citation_graph:
+        build_citation_graph(querier, options.max_citations, options.dump_dir)
+    elif options.csv:
         csv(querier)
     elif options.csv_header:
         csv(querier, header=True)
