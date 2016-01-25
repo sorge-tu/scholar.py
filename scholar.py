@@ -6,6 +6,15 @@ page. It is not a recursive crawler.
 """
 # ChangeLog
 # ---------
+# 2.9a  Added
+#         - support for proxies via environment variables,
+#         - parsing Google Scholar article ID if there is no cluster ID
+#         - sanity-check when requesting multiple pages, aborting early if
+#           something went wrong
+#         - new query type: getting all citations of an article
+#         - support for choosing random user agents from a given text file
+#         - print to file
+#         - build citation graphs
 #
 # 2.9   Fixed Unicode problem in certain queries. Thanks to smidm for
 #       this contribution.
@@ -158,12 +167,6 @@ import sys
 import re
 import time
 import random
-
-#import socks
-#import socket
-
-#socks.setdefaultproxy(socks.PROXY_TYPE_SOCKS5, "127.0.0.1", 9050)
-#socket.socket = socks.socksocket
 
 try:
     # Try importing for Python 3
@@ -632,6 +635,8 @@ class ScholarQuery(object):
     """
     def __init__(self):
         self.url = None
+
+        # The number of results requested from Scholar per page.
         self.num_page_results = ScholarConf.MAX_PAGE_RESULTS
         
         # The number of results requested from Scholar -- not the
@@ -674,7 +679,7 @@ class ScholarQuery(object):
         idx = max([item[2] for item in self.attrs.values()]) + 1
         self.attrs[key] = [default_value, label, idx]
 
-            def __getitem__(self, key):
+    def __getitem__(self, key):
         """Getter for attribute value. Returns None if no such key."""
         if key in self.attrs:
             return self.attrs[key][0]
@@ -797,12 +802,12 @@ class SearchScholarQuery(ScholarQuery):
         + '&as_publication=%(pub)s' \
         + '&as_ylo=%(ylo)s' \
         + '&as_yhi=%(yhi)s' \
-#        + '&btnG=&hl=en&as_sdt=0,5&num=%(num)s' \
-#        + '&start=%(startpage)s'
+        + '&start=%(startpage)s' \
         + '&as_sdt=%(patents)s%%2C5' \
         + '&as_vis=%(citations)s' \
         + '&btnG=&hl=en' \
         + '&num=%(num)s'
+    #       + '&btnG=&hl=en&as_sdt=0,5&num=%(num)s' \
 
     def __init__(self):
         ScholarQuery.__init__(self)
@@ -897,8 +902,7 @@ class SearchScholarQuery(ScholarQuery):
                    'pub': self.pub or '',
                    'ylo': self.timeframe[0] or '',
                    'yhi': self.timeframe[1] or '',
-#                   'num': self.num_page_results or ScholarConf.MAX_PAGE_RESULTS,
-#                   'startpage': self.startpage or '0'}
+                   'startpage': self.startpage or '0',
                    'patents': '0' if self.include_patents else '1',
                    'citations': '0' if self.include_citations else '1',
                    'num': self.num_results or ScholarConf.MAX_PAGE_RESULTS}
@@ -1119,7 +1123,6 @@ class ScholarQuerier(object):
         This method allows parsing of provided HTML content.
         """
         parser = self.Parser(self)
-#T        return parser.parse(html)
         parser.parse(html)
 
     def add_article(self, art):
@@ -1450,7 +1453,11 @@ scholar.py -c 5 -a "albert einstein" -t --none "quantum theory" --after 1970"""
     querier.send_query(query)
 
     if options.build_citation_graph:
-        build_citation_graph(querier, options.max_citations, options.dump_dir)
+        if options.dump_dir is not None:
+            build_citation_graph(querier, options.max_citations, options.dump_dir)
+        else:
+            ScholarUtils.log('error', 'Option dump-dir has to be set for building citation graphs.')
+            return 1
     elif options.csv:
         csv(querier)
     elif options.csv_header:
